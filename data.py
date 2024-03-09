@@ -1,5 +1,5 @@
 import tensorflow as tf
-from datasets import load_dataset
+import tensorflow_datasets as tfds
 from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained("openai-gpt")
@@ -15,8 +15,7 @@ def tokenize_py_func(text):
 
 def load_data(batch_size):
 
-  d = load_dataset("wikipedia", "20220301.en")['train'].to_tf_dataset()
-  d = (d
+  d = (tfds.load('wikipedia')['train']
      .map(lambda x: x['text'], num_parallel_calls=tf.data.AUTOTUNE)
      .map(tokenize_py_func, num_parallel_calls=tf.data.AUTOTUNE)
      .map(lambda x: {'x': x[0][:-1], 'y': tf.roll(x[0], -1, 0)[:-1]}, num_parallel_calls=tf.data.AUTOTUNE)
