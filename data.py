@@ -5,6 +5,7 @@ from transformers import AutoTokenizer
 tokenizer = AutoTokenizer.from_pretrained("openai-gpt")
 VOCAB_SIZE = tokenizer.vocab_size
 
+
 @tf.py_function(Tout=tf.int32)
 def tokenize_py_func(text):
     # Convert tensor to numpy array
@@ -13,16 +14,28 @@ def tokenize_py_func(text):
     return tokenizer.encode(text, return_tensors="tf")
 
 
-def load_data(batch_size):
+def load_data(batch_size, seq_length):
 
-  d = (tfds.load('wikipedia')['train']
-     .map(lambda x: x['text'], num_parallel_calls=tf.data.AUTOTUNE)
-     .map(tokenize_py_func, num_parallel_calls=tf.data.AUTOTUNE)
-     .map(lambda x: {'x': x[0][:-1], 'y': tf.roll(x[0], -1, 0)[:-1]}, num_parallel_calls=tf.data.AUTOTUNE)
-     .unbatch() 
-     .shuffle(1024)
-     .batch(batch_size)
-     .prefetch(1)
+    def split_into_sequences(x):
+        # Generate a random number for dropping tokens
+        d = tf.random.uniform(shape=[], minval=0, maxval=seq_length, dtype=tf.int32)
+        # Drop the first d tokens and the last few tokens to make it a multiple of seq_length
+        x_shape = tf.shape(x)
+        begin, end = d, d + (((x_shape[1] - d) // seq_length) * seq_length)
+        x = x[0, begin : end]
+        # Split into sequences of specified length
+        x = tf.reshape(x, (-1, seq_length))
+        y = tf.roll(x, shift=-1, axis=-1)
+        return {"x": x, "y": y}
+
+    d = (
+        tfds.load("wikipedia")["train"]
+        .map(lambda x: x["text"])
+        .map(tokenize_py_func, num_parallel_calls=tf.data.AUTOTUNE)
+        .map(split_into_sequences, num_parallel_calls=tf.data.AUTOTUNE)
+        .unbatch()
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
     )
 
-  return d.as_numpy_iterator()
+    return d.as_numpy_iterator()

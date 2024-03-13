@@ -26,7 +26,8 @@ BATCH_SIZE = 64
 CKPT_DIR = "/home/trung/transformer/ckpt/unigram"
 WARMSTART = True
 MODEL = unigram.UnigramModel(vocab_size=VOCAB_SIZE, embedding_dim=64)
-
+NUM_STEPS = 10
+CONTEXT_LENGTH = 128
 
 @struct.dataclass
 class Metrics(metrics.Collection):
@@ -70,6 +71,8 @@ def train_step(state, batch):
 @jax.jit
 def compute_metrics(*, state, batch):
     logits = state.apply_fn({"params": state.params}, batch["x"])
+    logits = logits.reshape(-1, logits.shape[-1])
+    labels = batch["y"].reshape(-1)
     loss = optax.softmax_cross_entropy_with_integer_labels(
         logits=logits, labels=batch["y"]
     ).mean()
@@ -133,20 +136,26 @@ wandb.init(
     config=MODEL.cfg(),
 )
 
-d_iter = load_data(batch_size=BATCH_SIZE)
+d_iter = load_data(batch_size=BATCH_SIZE, seq_length=CONTEXT_LENGTH)
 
 # Training loop
-while True:
+for i in range(NUM_STEPS):
 
+    step += 1
+    print("Step: ", step)
+    
+    print("Loading batch ")
     # Get the next batch from the training dataset
     train_batch = next(d_iter)
 
+    print("Running train step")
     # Run optimization steps over training batches and compute batch metrics
     state = train_step(
         state, train_batch
     )  # get updated train state (which contains the updated parameters)
     state = compute_metrics(state=state, batch=train_batch)  # aggregate batch metrics
 
+    print("Done running train step")
     if step % 1000 == 0:
         metrics_dict = {}
         for metric, value in state.metrics.compute().items():  # compute metrics
