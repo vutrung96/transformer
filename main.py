@@ -14,7 +14,7 @@ import optax
 import orbax.checkpoint
 import wandb
 
-from models import unigram
+from models import rnn, unigram
 from data import load_data
 from const import VOCAB_SIZE
 from flax.training import orbax_utils
@@ -23,11 +23,15 @@ import orbax.checkpoint as ocp
 
 EMBEDDING_DIM = 64
 BATCH_SIZE = 64
-CKPT_DIR = "/home/trung/transformer/ckpt/unigram"
-WARMSTART = True
-MODEL = unigram.UnigramModel(vocab_size=VOCAB_SIZE, embedding_dim=64)
-NUM_STEPS = 10
+LATENT_DIM = 64
+CKPT_DIR = "/home/trung/transformer/ckpt/rnn"
+WARMSTART = False
+MODEL = rnn.RNN(vocab_size=VOCAB_SIZE, embedding_dim=EMBEDDING_DIM, latent_dim=LATENT_DIM)
+NUM_STEPS = 1000000
 CONTEXT_LENGTH = 128
+LEARNING_RATE = 0.01
+WARMUP_STEPS = 100
+DECAY_STEPS = 500
 
 @struct.dataclass
 class Metrics(metrics.Collection):
@@ -39,13 +43,20 @@ class TrainState(train_state.TrainState):
     metrics: Metrics
 
 
-def create_train_state(module, rng, learning_rate, momentum):
+def create_train_state(module, rng, learning_rate):
     """Creates an initial `TrainState`."""
-    dummy = random.randint(key1, minval=0, maxval=10, shape=(10,))
+    dummy = random.randint(key1, minval=0, maxval=10, shape=(BATCH_SIZE, CONTEXT_LENGTH))
     params = module.init(rng, dummy)[
         "params"
     ]  # initialize parameters by passing a template image
-    tx = optax.sgd(learning_rate, momentum)
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=LEARNING_RATE,
+        warmup_steps=WARMUP_STEPS,
+        decay_steps=DECAY_STEPS,
+        end_value=0.0
+    )
+    tx = optax.adamw(learning_rate=schedule)
     return TrainState.create(
         apply_fn=module.apply, params=params, tx=tx, metrics=Metrics.empty()
     )
@@ -74,10 +85,10 @@ def compute_metrics(*, state, batch):
     logits = logits.reshape(-1, logits.shape[-1])
     labels = batch["y"].reshape(-1)
     loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits=logits, labels=batch["y"]
+        logits=logits, labels=labels
     ).mean()
     metric_updates = state.metrics.single_from_model_output(
-        logits=logits, labels=batch["y"], loss=loss
+        logits=logits, labels=labels, loss=loss
     )
     metrics = state.metrics.merge(metric_updates)
     state = state.replace(metrics=metrics)
@@ -92,11 +103,8 @@ def pred_step(state, x, key, T=10):
 
 key1, key2 = random.split(random.key(0))
 
-learning_rate = 0.01
-momentum = 0.9
-
 init_rng = jax.random.key(0)
-state = create_train_state(MODEL, init_rng, learning_rate, momentum)
+state = create_train_state(MODEL, init_rng, LEARNING_RATE)
 ckpt_metadata = CheckpointMetadata(wandb_id="", step=0, cfg=MODEL.cfg())
 metrics_history = {"train_loss": [], "train_accuracy": []}
 
@@ -114,53 +122,56 @@ if WARMSTART:
     target = {"model": state, "metadata": ckpt_metadata.to_dict()}
     # print("Abstract ckpt: ", abstract_ckpt)
     restored_ckpt = checkpoint_manager.restore(
-        checkpoint_manager.latest_step(),
-        items = target
+        checkpoint_manager.latest_step(), items=target
     )
     step = latest_step
-    state = restored_ckpt['model']
-    assert restored_ckpt['metadata']['cfg'] == MODEL.cfg()
-    ckpt_metadata = CheckpointMetadata.from_dict(restored_ckpt['metadata'])
-    print("Restored model: ", state)
+    state = restored_ckpt["model"]
+    assert restored_ckpt["metadata"]["cfg"] == MODEL.cfg()
+    ckpt_metadata = CheckpointMetadata.from_dict(restored_ckpt["metadata"])
+    # print("Restored model: ", state)
 else:
     print("Starting from scratch")
     wandb_id = wandb.util.generate_id()
     ckpt_metadata.wandb_id = wandb_id
 
+logged_cfg = MODEL.cfg()
+logged_cfg["scheduler"] = "cosine_warmup"
+logged_cfg["learning_rate"] = LEARNING_RATE
+logged_cfg["warmup_steps"] = WARMUP_STEPS
+logged_cfg["decay_steps"] = DECAY_STEPS
 wandb.init(
     # set the wandb project where this run will be logged
     project="transformer",
     resume="allow",
     id=ckpt_metadata.wandb_id,
     # track hyperparameters and run metadata
-    config=MODEL.cfg(),
+    config=logged_cfg
 )
 
 d_iter = load_data(batch_size=BATCH_SIZE, seq_length=CONTEXT_LENGTH)
+
+print("Starting training")
 
 # Training loop
 for i in range(NUM_STEPS):
 
     step += 1
     print("Step: ", step)
-    
-    print("Loading batch ")
+
     # Get the next batch from the training dataset
     train_batch = next(d_iter)
 
-    print("Running train step")
     # Run optimization steps over training batches and compute batch metrics
     state = train_step(
         state, train_batch
     )  # get updated train state (which contains the updated parameters)
     state = compute_metrics(state=state, batch=train_batch)  # aggregate batch metrics
 
-    print("Done running train step")
-    if step % 1000 == 0:
+    if step % 100 == 0:
         metrics_dict = {}
         for metric, value in state.metrics.compute().items():  # compute metrics
             metrics_dict[f"{metric}"] = value  # record metrics
-        wandb.log(metrics_dict)
+        wandb.log(data=metrics_dict, step=step)
 
     if step % 10000 == 0:
         ckpt = {"model": state, "metadata": ckpt_metadata.to_dict()}

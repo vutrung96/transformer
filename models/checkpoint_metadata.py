@@ -3,6 +3,7 @@ from enum import Enum, auto
 
 class ModelType(Enum):
     UNIGRAM = 'unigram'
+    RNN = 'rnn'
     
 @dataclass
 class CheckpointMetadata:
