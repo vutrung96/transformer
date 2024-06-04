@@ -28,14 +28,18 @@ def load_data(batch_size, seq_length):
         y = tf.roll(x, shift=-1, axis=-1)
         return {"x": x, "y": y}
 
-    d = (
-        tfds.load("wikipedia")["train"]
-        .map(lambda x: x["text"])
-        .map(tokenize_py_func, num_parallel_calls=tf.data.AUTOTUNE)
-        .map(split_into_sequences, num_parallel_calls=tf.data.AUTOTUNE)
-        .unbatch()
-        .batch(batch_size)
-        .prefetch(tf.data.AUTOTUNE)
-    )
+    def get_data(train):
+        split = "train[:95%]" if train else "train[95%:]"
+        d = (
+            tfds.load("wikipedia", split=split)
+            .shard(num_shards=10, index=0)
+            .map(lambda x: x["text"])
+            .map(tokenize_py_func, num_parallel_calls=tf.data.AUTOTUNE)
+            .map(split_into_sequences, num_parallel_calls=tf.data.AUTOTUNE)
+            .unbatch()
+            .batch(batch_size)
+            .prefetch(tf.data.AUTOTUNE)
+        )
+        return d
 
-    return d.as_numpy_iterator()
+    return get_data(True).as_numpy_iterator(), get_data(False).as_numpy_iterator()

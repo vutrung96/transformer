@@ -1,4 +1,5 @@
 import jax
+import jax.numpy as jnp
 import optax
 import wandb
 from clu import metrics
@@ -25,12 +26,17 @@ class TrainerConfig:
     warmup_steps: int
     decay_steps: int
     track: bool
+    b1: float
+    debug_grad: bool
 
 
 @struct.dataclass
 class Metrics(metrics.Collection):
-    accuracy: metrics.Accuracy
-    loss: metrics.Average.from_output("loss")
+    train_loss: metrics.Average.from_output("train_loss")
+    grad_norm_d0_i0: metrics.Average.from_output("grad_norm_d0_i0")
+    grad_norm_d0_i30: metrics.Average.from_output("grad_norm_d0_i30")
+    grad_norm_d1_i0: metrics.Average.from_output("grad_norm_d1_i0")
+    grad_norm_d1_i30: metrics.Average.from_output("grad_norm_d1_i30")
 
 
 class TrainState(train_state.TrainState):
@@ -45,9 +51,9 @@ def create_train_state(rng, trainer_cfg):
         maxval=10,
         shape=(trainer_cfg.batch_size, trainer_cfg.context_length),
     )
-    params = trainer_cfg.model.init(rng, dummy)[
-        "params"
-    ]  # initialize parameters by passing a template image
+    rng, subkey = jax.random.split(rng)
+    variables = trainer_cfg.model.init(subkey, dummy)
+    params, perturbations = variables["params"], variables["perturbations"]
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=trainer_cfg.learning_rate,
@@ -55,9 +61,15 @@ def create_train_state(rng, trainer_cfg):
         decay_steps=trainer_cfg.decay_steps,
         end_value=0.0,
     )
-    tx = optax.adamw(learning_rate=schedule)
-    return TrainState.create(
-        apply_fn=trainer_cfg.model.apply, params=params, tx=tx, metrics=Metrics.empty()
+    tx = optax.adamw(learning_rate=schedule, b1=trainer_cfg.b1)
+    return (
+        TrainState.create(
+            apply_fn=trainer_cfg.model.apply,
+            params=params,
+            tx=tx,
+            metrics=Metrics.empty(),
+        ),
+        perturbations,
     )
 
 
@@ -70,25 +82,69 @@ def train_step(state, batch):
         loss = optax.softmax_cross_entropy_with_integer_labels(
             logits=logits, labels=batch["y"]
         ).mean()
-        return loss
+        return loss, logits
 
-    grad_fn = jax.grad(loss_fn)
-    grads = grad_fn(state.params)
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (_, logits), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
+    return state, logits
+
+
+@jax.jit
+def train_step_debug(state, perturbations, batch):
+    """Train for a single step."""
+
+    def loss_fn(params, perturbations):
+        logits = state.apply_fn(
+            {"params": params, "perturbations": perturbations}, batch["x"]
+        )
+        loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits=logits, labels=batch["y"]
+        ).mean()
+        return loss, logits
+
+    grad_fn = jax.value_and_grad(loss_fn, argnums=(0,1), has_aux=True)
+    (_, logits), (grads, grads_dbg) = grad_fn(state.params, perturbations)
+    state = state.apply_gradients(grads=grads)
+    return state, logits, grads_dbg
+    
+
+@jax.jit
+def compute_metrics(logits, state, batch, grads_dbg=None):
+    labels = batch["y"]
+    loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits=logits, labels=labels
+    ).mean()
+    grad_norm_d0_i0 = jax.numpy.linalg.norm(grads_dbg["state_cell_0_0"], axis=1)
+    grad_norm_d0_i30 = jax.numpy.linalg.norm(grads_dbg["state_cell_0_30"], axis=1)
+    grad_norm_d1_i0 = jax.numpy.linalg.norm(grads_dbg["state_cell_1_0"], axis=1)
+    grad_norm_d1_i30 = jax.numpy.linalg.norm(grads_dbg["state_cell_1_30"], axis=1)
+    metric_updates = state.metrics.single_from_model_output(
+        grad_norm_d0_i0=grad_norm_d0_i0,
+        grad_norm_d0_i30=grad_norm_d0_i30,
+        grad_norm_d1_i0=grad_norm_d1_i0,
+        grad_norm_d1_i30=grad_norm_d1_i30,
+        train_loss=loss,
+        eval_loss = jnp.nan
+    )
+    metrics = state.metrics.merge(metric_updates)
+    state = state.replace(metrics=metrics)
     return state
 
 
 @jax.jit
-def compute_metrics(*, state, batch):
+def eval_step(state, batch):
     logits = state.apply_fn({"params": state.params}, batch["x"])
-    logits = logits.reshape(-1, logits.shape[-1])
-    labels = batch["y"].reshape(-1)
     loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits=logits, labels=labels
+        logits=logits, labels=batch["y"]
     ).mean()
     metric_updates = state.metrics.single_from_model_output(
-        logits=logits, labels=labels, loss=loss
-    )
+        grad_norm_d0_i0=jnp.nan,
+        grad_norm_d0_i30=jnp.nan,
+        grad_norm_d1_i0=jnp.nan,
+        grad_norm_d1_i30=jnp.nan,
+        train_loss = jnp.nan,
+        eval_loss=loss)
     metrics = state.metrics.merge(metric_updates)
     state = state.replace(metrics=metrics)
     return state
@@ -104,10 +160,7 @@ def train(trainer_cfg):
 
     init_rng = jax.random.key(0)
 
-    state = create_train_state(
-        init_rng,
-        trainer_cfg
-    )
+    state, perturbations = create_train_state(init_rng, trainer_cfg)
     ckpt_metadata = CheckpointMetadata(wandb_id="", step=0, cfg=trainer_cfg.model.cfg())
 
     options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
@@ -122,7 +175,6 @@ def train(trainer_cfg):
         latest_step = checkpoint_manager.latest_step()
         print("Latest step ", latest_step)
         target = {"model": state, "metadata": ckpt_metadata.to_dict()}
-        # print("Abstract ckpt: ", abstract_ckpt)
         restored_ckpt = checkpoint_manager.restore(
             checkpoint_manager.latest_step(), items=target
         )
@@ -130,7 +182,6 @@ def train(trainer_cfg):
         state = restored_ckpt["model"]
         assert restored_ckpt["metadata"]["cfg"] == trainer_cfg.model.cfg()
         ckpt_metadata = CheckpointMetadata.from_dict(restored_ckpt["metadata"])
-        # print("Restored model: ", state)
     else:
         print("Starting from scratch")
         wandb_id = wandb.util.generate_id()
@@ -153,7 +204,7 @@ def train(trainer_cfg):
             config=logged_cfg,
         )
 
-    d_iter = load_data(
+    d_iter, d_test_iter = load_data(
         batch_size=trainer_cfg.batch_size, seq_length=trainer_cfg.context_length
     )
 
@@ -168,19 +219,27 @@ def train(trainer_cfg):
         train_batch = next(d_iter)
 
         # Run optimization steps over training batches and compute batch metrics
-        state = train_step(
-            state, train_batch
-        )  # get updated train state (which contains the updated parameters)
+        if trainer_cfg.debug_grad:
+            state, logits, grads_dbg  = train_step_debug(state, perturbations, train_batch)
+        else:
+            state, logits = train_step(
+                state, train_batch
+            )  # get updated train state (which contains the updated parameters)
         state = compute_metrics(
-            state=state, batch=train_batch
+            logits,
+            state,
+            train_batch,
+            grads_dbg=grads_dbg if trainer_cfg.debug_grad else None,
         )  # aggregate batch metrics
         if step % 100 == 0:
             print("Step: ", step)
+            state = eval_step(state, next(d_test_iter))  # evaluate on test set
             metrics_dict = {}
             for metric, value in state.metrics.compute().items():  # compute metrics
                 metrics_dict[f"{metric}"] = value  # record metrics
             if trainer_cfg.track:
                 wandb.log(data=metrics_dict, step=step)
+            state.replace(metrics=Metrics.empty())
 
         if step % 10000 == 0:
             ckpt = {"model": state, "metadata": ckpt_metadata.to_dict()}
